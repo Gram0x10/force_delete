@@ -1,0 +1,15 @@
+[package]
+name = "force_delete"
+version = "1.0.0"
+edition = "2021"
+
+[dependencies]
+walkdir = "2.4"
+windows-sys = { version = "0.52", features = [
+    "Win32_System_RestartManager",
+    "Win32_Foundation",
+    "Win32_System_Threading",
+] }
+
+[build-dependencies]
+winres = "0.1"
