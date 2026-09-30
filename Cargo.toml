@@ -2,6 +2,7 @@
 name = "force_delete"
 version = "1.0.0"
 edition = "2021"
+license = "MIT"
 
 [dependencies]
 walkdir = "2.4"
