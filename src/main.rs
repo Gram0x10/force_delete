@@ -1,7 +1,9 @@
 use std::env;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::thread::sleep;
+use std::time::Duration;
 use std::os::windows::process::CommandExt;
 use std::os::windows::ffi::OsStrExt;
 use walkdir::WalkDir;
@@ -10,10 +12,15 @@ use windows_sys::Win32::System::RestartManager::{
     RmStartSession, RmRegisterResources, RmGetList, RmShutdown, RmEndSession,
     RmForceShutdown, RM_PROCESS_INFO
 };
-use windows_sys::Win32::Foundation::{ERROR_SUCCESS, ERROR_MORE_DATA, CloseHandle};
-use windows_sys::Win32::System::Threading::{OpenProcess, TerminateProcess, PROCESS_TERMINATE};
+use windows_sys::Win32::Foundation::{ERROR_SUCCESS, ERROR_MORE_DATA, ERROR_INVALID_PARAMETER, WAIT_OBJECT_0, CloseHandle, GetLastError};
+use windows_sys::Win32::System::Console::SetConsoleOutputCP;
+use windows_sys::Win32::System::Threading::{
+    OpenProcess, TerminateProcess, WaitForSingleObject, QueryFullProcessImageNameW,
+    PROCESS_TERMINATE, PROCESS_QUERY_LIMITED_INFORMATION,
+};
 
 const CREATE_NO_WINDOW: u32 = 0x08000000;
+const SYNCHRONIZE_ACCESS: u32 = 0x0010_0000;
 const EXE_NAME: &str = "force_delete.exe";
 
 fn normalize_path(path: &Path) -> String {
@@ -72,61 +79,162 @@ impl Drop for RmSessionGuard {
 
 // 授权核心逻辑
 fn grant_permissions(path: &Path) {
-    let path_str = path.to_string_lossy();
-    let _ = Command::new("takeown").creation_flags(CREATE_NO_WINDOW).args(&["/f", &path_str, "/r", "/d", "y"]).status();
-    let _ = Command::new("icacls").creation_flags(CREATE_NO_WINDOW).args(&[&path_str, "/grant", "administrators:F", "/t", "/q"]).status();
+    // takeown/icacls 只认反斜杠，正斜杠路径会报"找不到文件"
+    let path_str = path.to_string_lossy().replace('/', "\\");
+    let _ = Command::new("takeown").creation_flags(CREATE_NO_WINDOW)
+        .args(&["/f", &path_str, "/r", "/d", "y"])
+        .stdout(Stdio::null()).stderr(Stdio::null()).status();
+    let _ = Command::new("icacls").creation_flags(CREATE_NO_WINDOW)
+        .args(&[&path_str, "/grant", "administrators:F", "/t", "/q"])
+        .stdout(Stdio::null()).stderr(Stdio::null()).status();
 }
 
-// 解除占用并杀进程
-fn unlock_resources(files: &[PathBuf]) -> bool {
-    if files.is_empty() { return true; }
+// 收集需要解除占用的文件列表。
+// 注意：不能把目录注册进 Restart Manager —— 实测注册目录会让 RmGetList 整体返回
+// ERROR_ACCESS_DENIED(5)，连带所有文件都查不到占用者。
+fn collect_unlock_targets(target_path: &Path) -> Vec<PathBuf> {
+    let mut targets = Vec::new();
+    if target_path.is_dir() {
+        for entry in WalkDir::new(target_path).into_iter().filter_map(|e| e.ok()) {
+            if entry.file_type().is_file() {
+                targets.push(entry.into_path());
+            }
+        }
+    } else {
+        targets.push(target_path.to_path_buf());
+    }
+    targets
+}
+
+// 获取进程可执行文件路径（失败返回空串）
+fn process_image_path(pid: u32) -> String {
+    unsafe {
+        let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if h == 0 { return String::new(); }
+        let mut buf = [0u16; 1024];
+        let mut size = buf.len() as u32;
+        let ok = QueryFullProcessImageNameW(h, 0, buf.as_mut_ptr(), &mut size);
+        CloseHandle(h);
+        if ok == 0 { String::new() } else { String::from_utf16_lossy(&buf[..size as usize]) }
+    }
+}
+
+// 系统关键进程不能杀，杀了直接蓝屏/登不出
+fn is_critical_process(exe_path: &str, pid: u32) -> bool {
+    if pid == 0 || pid == 4 || pid == std::process::id() { return true; }
+    let name = exe_path.rsplit('\\').next().unwrap_or("").to_lowercase();
+    matches!(name.as_str(),
+        "csrss.exe" | "smss.exe" | "wininit.exe" | "winlogon.exe" | "lsass.exe" | "services.exe")
+}
+
+// 强制终止进程并等它真正退出（最多 5 秒）。返回结果描述。
+fn terminate_and_wait(pid: u32) -> String {
+    unsafe {
+        let h = OpenProcess(PROCESS_TERMINATE | SYNCHRONIZE_ACCESS, 0, pid);
+        if h == 0 {
+            return if GetLastError() == ERROR_INVALID_PARAMETER {
+                "进程已退出".to_string()
+            } else {
+                "权限不足，无法终止".to_string()
+            };
+        }
+        if TerminateProcess(h, 1) == 0 {
+            let err = GetLastError();
+            // RmShutdown 可能已抢先杀掉：快速探一下句柄是否已 signaled
+            if WaitForSingleObject(h, 500) == WAIT_OBJECT_0 {
+                CloseHandle(h);
+                return "进程已退出".to_string();
+            }
+            CloseHandle(h);
+            return format!("终止失败 (错误码 {})", err);
+        }
+        let _ = WaitForSingleObject(h, 5000);
+        CloseHandle(h);
+        "已终止".to_string()
+    }
+}
+
+// 单轮：查询占用进程 -> 尽力 RmShutdown -> 逐个击杀。返回本轮查到的占用进程数
+fn find_and_kill_lockers(files: &[PathBuf], round: u32) -> Result<u32, ()> {
     unsafe {
         let mut session_handle = 0;
         let mut session_key = [0u16; 33];
-        
+
         let res = RmStartSession(&mut session_handle, 0, session_key.as_mut_ptr());
-        if res != ERROR_SUCCESS as u32 { return false; }
+        if res != ERROR_SUCCESS as u32 {
+            eprintln!("[占用查询] 启动 Restart Manager 会话失败 (错误码 {})", res);
+            return Err(());
+        }
         let _guard = RmSessionGuard { handle: session_handle };
 
-        let mut wide_paths: Vec<Vec<u16>> = files.iter().map(|p| {
+        let wide_paths: Vec<Vec<u16>> = files.iter().map(|p| {
             let mut v: Vec<u16> = p.as_os_str().encode_wide().collect();
             v.push(0); v
         }).collect();
 
         let pcwstr_paths: Vec<*const u16> = wide_paths.iter().map(|v| v.as_ptr()).collect();
         let res = RmRegisterResources(session_handle, pcwstr_paths.len() as u32, pcwstr_paths.as_ptr(), 0, std::ptr::null(), 0, std::ptr::null());
-        if res != ERROR_SUCCESS as u32 { return false; }
+        if res != ERROR_SUCCESS as u32 {
+            eprintln!("[占用查询] 注册待查文件失败 (错误码 {}, 文件数 {})", res, pcwstr_paths.len());
+            return Err(());
+        }
 
         let mut proc_info_needed = 0;
         let mut proc_info = 0;
         let mut reboot_reasons = 0;
         let res = RmGetList(session_handle, &mut proc_info_needed, &mut proc_info, std::ptr::null_mut(), &mut reboot_reasons);
-        if res != ERROR_SUCCESS as u32 && res != ERROR_MORE_DATA as u32 { return false; }
-        if proc_info_needed == 0 { return true; }
+        if res != ERROR_SUCCESS as u32 && res != ERROR_MORE_DATA as u32 {
+            eprintln!("[占用查询] 查询占用进程失败 (错误码 {})", res);
+            return Err(());
+        }
+        if proc_info_needed == 0 {
+            if round == 1 { println!("[2/3] 未发现占用进程。"); }
+            return Ok(0);
+        }
 
         let mut process_info = vec![std::mem::zeroed::<RM_PROCESS_INFO>(); proc_info_needed as usize];
         proc_info = proc_info_needed;
         let res = RmGetList(session_handle, &mut proc_info_needed, &mut proc_info, process_info.as_mut_ptr(), &mut reboot_reasons);
-        if res != ERROR_SUCCESS as u32 { return false; }
+        if res != ERROR_SUCCESS as u32 { return Err(()); }
 
-        println!("[2/3] 发现 {} 个占用进程，正在尝试终止...", proc_info);
-        for info in process_info.iter().take(proc_info as usize) {
-            let name = String::from_utf16_lossy(&info.strAppName);
-            println!("  - 终止占用进程: {} (PID: {})", name.trim_matches('\0'), info.Process.dwProcessId);
+        let count = proc_info;
+        if round == 1 {
+            println!("[2/3] 发现 {} 个占用进程，正在终止...", count);
+        } else {
+            println!("  仍有 {} 个占用进程，继续终止...", count);
         }
 
-        let res = RmShutdown(session_handle, RmForceShutdown as u32, None);
-        if res != ERROR_SUCCESS as u32 {
-            for info in process_info.iter().take(proc_info as usize) {
-                let h_process = OpenProcess(PROCESS_TERMINATE, 0, info.Process.dwProcessId);
-                if h_process != 0 {
-                    let _ = TerminateProcess(h_process, 0);
-                    let _ = CloseHandle(h_process);
-                }
+        // 先请求系统级关闭（对部分应用更干净），失败无所谓，下面硬杀兜底
+        let _ = RmShutdown(session_handle, RmForceShutdown as u32, None);
+
+        for info in process_info.iter().take(count as usize) {
+            let pid = info.Process.dwProcessId;
+            let app_name = String::from_utf16_lossy(&info.strAppName).trim_matches('\0').to_string();
+            let exe = process_image_path(pid);
+            if is_critical_process(&exe, pid) {
+                println!("  - 跳过系统关键进程: {} (PID {})", app_name, pid);
+                continue;
             }
+            let label = if exe.is_empty() { app_name } else { exe };
+            let outcome = terminate_and_wait(pid);
+            println!("  - {}: {} (PID {})", outcome, label, pid);
+        }
+        Ok(count)
+    }
+}
+
+// 解除占用：循环“查占用 -> 杀 -> 再查”直到文件不再被占用；返回是否已解锁
+fn unlock_resources(files: &[PathBuf]) -> bool {
+    if files.is_empty() { return true; }
+    for round in 1..=4 {
+        match find_and_kill_lockers(files, round) {
+            Ok(0) => return true,
+            Ok(_) if round < 4 => sleep(Duration::from_millis(400)),
+            Ok(_) => {}
+            Err(()) => return false,
         }
     }
-    true
+    false
 }
 
 // 执行安装逻辑
@@ -208,6 +316,9 @@ fn uninstall_self() {
 }
 
 fn main() {
+    // 控制台默认 GBK，而 Rust println 输出 UTF-8，不设置会全乱码
+    unsafe { SetConsoleOutputCP(65001); }
+
     let args: Vec<String> = env::args().collect();
     let current_exe = env::current_exe().unwrap_or_default();
 
@@ -272,33 +383,48 @@ fn main() {
         return;
     }
 
+    println!("[1/3] 正在夺取文件权限...");
     grant_permissions(target_path);
 
-    let mut files_to_unlock = Vec::new();
-    if target_path.is_dir() {
-        for entry in WalkDir::new(target_path).into_iter().filter_map(|e| e.ok()) {
-            if entry.file_type().is_file() {
-                files_to_unlock.push(entry.into_path());
+    let mut files_to_unlock = collect_unlock_targets(target_path);
+
+    // 循环：查占用 -> 杀进程 -> 尝试删除 -> 失败再查再杀，最多 5 轮
+    let mut delete_result = None;
+    for round in 1..=5 {
+        if round > 1 {
+            println!("[重试 {}/5] 删除未完成，重新查找占用进程...", round);
+            if !target_path.exists() { break; }
+            files_to_unlock = collect_unlock_targets(target_path);
+        }
+
+        unlock_resources(&files_to_unlock);
+        grant_permissions(target_path);
+
+        println!("[3/3] 正在强制删除...");
+        let result = if target_path.is_dir() {
+            std::fs::remove_dir_all(target_path)
+        } else {
+            std::fs::remove_file(target_path)
+        };
+
+        match result {
+            Ok(()) => { delete_result = Some(()); break; }
+            Err(e) => {
+                if !target_path.exists() {
+                    delete_result = Some(());
+                    break;
+                }
+                println!("  删除失败: {}", e);
+                delete_result = None;
+                sleep(Duration::from_millis(300));
             }
         }
-    } else {
-        files_to_unlock.push(target_path.to_path_buf());
     }
 
-    unlock_resources(&files_to_unlock);
-    grant_permissions(target_path);
-
-    println!("[3/3] 正在强制删除...");
-    let delete_result = if target_path.is_dir() {
-        std::fs::remove_dir_all(target_path)
-    } else {
-        std::fs::remove_file(target_path)
-    };
-
-    if delete_result.is_ok() {
+    if delete_result.is_some() {
         println!("删除成功。");
     } else {
-        println!("警告: 部分文件可能未完全删除。");
+        println!("警告: 删除失败。可能仍有进程占用，或剩余文件为只读/系统保护文件。");
         system_pause();
     }
 }
